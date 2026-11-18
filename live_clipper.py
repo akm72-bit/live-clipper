@@ -13,14 +13,118 @@ Usage:
 Needs: Python 3.10+, FFmpeg on PATH, and `pip install -r requirements.txt`.
 It only works on channels that are LIVE. Start it before (or during) the stream.
 Only clip and post streams you have permission to use.
+
+GPU: clips are encoded on the GPU when there is one (AMD AMF, NVIDIA NVENC) and Whisper runs on
+the GPU too (NVIDIA through CUDA, AMD through ZLUDA: run `python setup_zluda.py` once). Without a
+usable GPU everything falls back to the CPU, just slower.
 """
-import argparse, collections, csv, json, os, queue, random, re, shutil, signal, socket, statistics, subprocess, sys, threading, time
+import argparse, collections, csv, glob, json, os, queue, random, re, shutil, signal, socket, statistics, subprocess, sys, threading, time
 from datetime import datetime
 
 SEG = 10  # seconds per recorded chunk and per chat bucket
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 def log(*a):
     print(time.strftime("[%H:%M:%S]"), *a, flush=True)
+
+# ---------------------------------------------------------------- GPU discovery
+_gpus = None
+
+def gpu_names():
+    """What Windows/Linux reports as the video cards in this machine (cached)."""
+    global _gpus
+    if _gpus is None:
+        out = ""
+        for cmd in (["wmic", "path", "win32_VideoController", "get", "name"],  # wmic is gone from newer Windows
+                    ["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_VideoController).Name"],
+                    ["lspci"]):
+            try:
+                out = subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if out.strip(): break
+        _gpus = [l.strip() for l in out.splitlines() if l.strip() and l.strip().lower() not in ("name", "device")]
+    return _gpus
+
+def has_gpu(word):
+    return any(word in n.lower() for n in gpu_names())
+
+def find_zluda():
+    """ZLUDA (CUDA -> AMD translation layer): ./zluda next to this script, $ZLUDA_DIR, or a system install."""
+    system = os.path.join(os.environ["ProgramFiles"], "zluda") if os.environ.get("ProgramFiles") else None
+    for d in (os.path.join(HERE, "zluda"), os.environ.get("ZLUDA_DIR"), system):
+        if d and os.path.exists(os.path.join(d, "zluda.exe")):
+            return d
+    return None
+
+def find_hip_sdk():
+    """A HIP SDK ZLUDA can use. It needs bin/rocblas.dll: ZLUDA's cuBLAS is a wrapper around rocBLAS."""
+    cands = ([os.environ["HIP_PATH"]] if os.environ.get("HIP_PATH") else [])
+    for pat in (r"C:\Program Files\AMD\ROCm\*", r"C:\Program Files\AMD\therock-dist-windows-*", "/opt/rocm", "/opt/rocm-*"):
+        cands += sorted(glob.glob(pat), reverse=True)  # newest first
+    for d in cands:
+        if os.path.exists(os.path.join(d, "bin", "rocblas.dll")) or os.path.exists(os.path.join(d, "lib", "librocblas.so")):
+            return d
+    return None
+
+def zluda_active():
+    """Are we already running with ZLUDA's CUDA shim patched in?"""
+    if os.environ.get("ZLUDA_RUNNING"):
+        return True
+    has_amd = has_gpu("amd") or has_gpu("radeon")
+    return has_amd and not has_gpu("nvidia")
+
+def relaunch_under_zluda(a):
+    """An AMD GPU only looks like a CUDA device to Whisper once ZLUDA is loaded, so start again through it.
+
+    Does nothing when there is nothing to do, and replaces this process when there is (the child inherits
+    our console, so the user keeps seeing one continuous stream of logs).
+    """
+    if a.cpu_only or os.environ.get("ZLUDA_RUNNING") or not (has_gpu("amd") or has_gpu("radeon")):
+        return False
+    try:
+        import ctranslate2
+        if ctranslate2.get_cuda_device_count() > 0:  # a real CUDA device (NVIDIA) is already visible
+            return False
+    except Exception:
+        pass
+    z = find_zluda()
+    if not z:
+        log("AMD GPU found, but ZLUDA is not installed: captions will run on the CPU. Run `python setup_zluda.py`.")
+        return False
+    hip = find_hip_sdk()
+    if not hip:
+        log("AMD GPU found, but no usable HIP SDK (needs bin/rocblas.dll): captions will run on the CPU. See the README.")
+        return False
+    env = dict(os.environ, HIP_PATH=hip, ZLUDA_RUNNING="1",
+               PATH=os.path.join(hip, "bin") + os.pathsep + os.environ.get("PATH", ""))
+    log(f"AMD GPU: restarting under ZLUDA ({z}) so Whisper can use it")
+    sys.stdout.flush()
+    sys.exit(subprocess.call([os.path.join(z, "zluda.exe"), "--", sys.executable, os.path.abspath(__file__)] + sys.argv[1:], env=env))
+
+# ---------------------------------------------------------------- video encoder
+def probe_encoder(enc, opts):
+    """The only reliable way to know an encoder works: encode a few frames with it."""
+    try:
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30",
+                            "-frames:v", "3", "-c:v", enc, *opts, "-f", "null", "-"], capture_output=True, text=True, timeout=60)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+def pick_encoder(pref="auto"):
+    """GPU encoding when the GPU is there (AMD AMF / NVIDIA NVENC), software x264 otherwise."""
+    table = {"amf": ("h264_amf", ["-quality", "speed", "-rc", "cqp", "-qp_i", "22", "-qp_p", "22", "-qp_b", "24"]),
+             "nvenc": ("h264_nvenc", ["-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0"]),
+             "x264": ("libx264", ["-preset", "veryfast", "-crf", "20"])}
+    for k in {"auto": ["amf", "nvenc", "x264"], "amf": ["amf"], "nvenc": ["nvenc"], "x264": ["x264"]}[pref]:
+        enc, opts = table[k]
+        if probe_encoder(enc, opts):
+            log(f"encoder: {enc}" + ("" if k == "x264" else " (GPU)"))
+            return enc, opts
+        if pref != "auto":
+            log(f"encoder: {enc} is not usable here, using software x264")
+    return table["x264"]
 
 # ---------------------------------------------------------------- recorder
 class Recorder:
@@ -152,11 +256,12 @@ class Clipper:
         from faster_whisper import WhisperModel
         try:
             import ctranslate2
-            gpu = ctranslate2.get_cuda_device_count() > 0
+            gpu = ctranslate2.get_cuda_device_count() > 0 and not self.a.cpu_only
         except Exception:
             gpu = False
         dev, ct = ("cuda", "float16") if gpu else ("cpu", "int8")
-        log(f"whisper: loading '{self.a.model}' on {dev}")
+        how = " (AMD GPU via ZLUDA)" if gpu and zluda_active() else ""
+        log(f"whisper: loading '{self.a.model}' on {dev}{how}")
         try:
             self.model = WhisperModel(self.a.model, device=dev, compute_type=ct)
         except Exception as e:
@@ -204,7 +309,7 @@ class Clipper:
         ss = max(0.0, t0 - first_start); dur = t1 - t0
         raw = os.path.join(d, "clip_16x9.mp4")
         run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i", lst,
-             "-ss", f"{ss:.2f}", "-t", f"{dur:.2f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+             "-ss", f"{ss:.2f}", "-t", f"{dur:.2f}", "-c:v", self.a.enc, *self.a.enc_opts, "-pix_fmt", "yuv420p",
              "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", raw])
         os.remove(lst)
         ass = None
@@ -219,7 +324,7 @@ class Clipper:
         vf = ("[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:2,eq=brightness=-0.08[bg];"
               "[0:v]scale=1080:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2" + (f",ass={ass}" if ass else "") + "[v]")
         run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", "clip_16x9.mp4", "-filter_complex", vf, "-map", "[v]", "-map", "0:a?",
-             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "copy", "-movflags", "+faststart", "clip_9x16.mp4"], cwd=d)
+             "-c:v", self.a.enc, *self.a.enc_opts, "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart", "clip_9x16.mp4"], cwd=d)
         json.dump({"channel": self.a.channel, "spike_time": datetime.fromtimestamp(sp["wall"]).isoformat(timespec="seconds"),
                    "msgs_in_10s": sp["count"], "baseline_10s": sp["base"], "chat_sample": sp["msgs"][:15]},
                   open(os.path.join(d, "info.json"), "w", encoding="utf-8"), indent=1, ensure_ascii=False)
@@ -286,11 +391,16 @@ def main():
     ap.add_argument("--no-captions", action="store_true", help="skip Whisper captions")
     ap.add_argument("--out", default="clips", help="output folder (default ./clips)")
     ap.add_argument("--buffer-minutes", type=float, default=5, help="minutes of video kept on disk (default 5)")
+    ap.add_argument("--encoder", choices=("auto", "amf", "nvenc", "x264"), default="auto",
+                    help="video encoder: auto picks AMD AMF, NVIDIA NVENC or software x264 (default auto)")
+    ap.add_argument("--cpu-only", action="store_true", help="never touch the GPU: software encoding, CPU captions")
     ap.add_argument("--test-clip-after", type=float, default=0, help="TEST: also force one clip after N seconds")
     a = ap.parse_args()
     a.channel = a.channel.lower().lstrip("#").split("/")[-1]
     if not shutil.which("ffmpeg"):
         sys.exit("FFmpeg not found. Install it and make sure `ffmpeg` runs in a terminal.")
+    relaunch_under_zluda(a)  # replaces this process when ZLUDA is what the GPU needs
+    a.enc, a.enc_opts = pick_encoder("x264" if a.cpu_only else a.encoder)
 
     work = os.path.join(a.out, f".buffer_{a.channel}")
     shutil.rmtree(work, ignore_errors=True)
@@ -335,6 +445,9 @@ def main():
             time.sleep(1)
         chat.stop.set(); rec.close()
         log("stopped.")
+        if os.environ.get("ZLUDA_RUNNING"):
+            # ZLUDA v7 preview panics in its thread-local destructors while unloading; skip the teardown
+            sys.stdout.flush(); sys.stderr.flush(); os._exit(0)
 
 if __name__ == "__main__":
     main()

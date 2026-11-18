@@ -12,6 +12,8 @@ From the @tokenstoviews reel *"Don't download the stream. Beat it."*
 4. **FFmpeg** cuts 25 s before the spike + 5 s after, and makes a 9:16 version (blurred background, full picture in the middle).
 5. **Whisper** (runs on your own PC) adds word-by-word captions.
 
+Your GPU does the heavy lifting when there is one: FFmpeg encodes the clips with **AMF** (AMD) or **NVENC** (NVIDIA), and Whisper captions run on the GPU too (**CUDA** on NVIDIA, **ZLUDA** on AMD). No GPU? Everything still works on the CPU, just slower.
+
 All free. Nothing is uploaded anywhere, and no AI credits or API keys are used.
 
 ## Setup (once, about 10 minutes)
@@ -27,7 +29,24 @@ All free. Nothing is uploaded anywhere, and no AI credits or API keys are used.
    ```
 4. Check that it worked: `ffmpeg -version` and `python -m streamlink --version` should both print a version.
 
-An NVIDIA GPU makes captions much faster, but it isn't required (it falls back to the CPU).
+That's it: no GPU drivers, CUDA toolkit or extra setup needed, whatever card you have. An NVIDIA GPU is picked up automatically. On AMD, one extra command gets the GPU working — see below.
+
+## Using your GPU (optional)
+
+**NVIDIA:** nothing to do. Clips encode with NVENC and Whisper uses CUDA.
+
+**AMD:** clips already encode on the GPU (AMF) with no setup at all. For GPU captions, Whisper needs to talk CUDA, which AMD doesn't speak — so [ZLUDA](https://github.com/vosen/ZLUDA) translates. Two pieces are needed:
+
+1. A recent **AMD driver**, plus the **HIP SDK** (it is *not* part of the driver). Grab the official **AMD HIP SDK for Windows** — but note it doesn't support every card (Radeon RX 6000 cards like the 6600 XT are `gfx1032`, which is unsupported). For those, download a nightly `therock-dist-windows-gfx103X-*.tar.gz` from [here](https://therock-nightly-tarball.s3.amazonaws.com/index.html), unpack it and set `HIP_PATH` to that folder. Either way, the folder must contain `bin\rocblas.dll`.
+2. **ZLUDA** itself, which the setup script fetches for you:
+
+```
+python setup_zluda.py
+```
+
+It installs ZLUDA into `./zluda` and checks the whole chain, telling you exactly what's missing if something is. After that, just run the clipper as usual: it notices the AMD GPU and restarts itself under ZLUDA, so Whisper captions on your GPU. If any piece is missing it says so and quietly captions on the CPU instead.
+
+Worth knowing: ZLUDA compiles shaders on first use, so the first few clips are slow and later ones are quick.
 
 ## Use it
 
@@ -58,6 +77,8 @@ Press **Ctrl+C** to stop.
 | `--cooldown 60` | 60 s | Minimum gap between two clips |
 | `--model small` | small | Better captions: `medium` or `large-v3` (slower). Weak PC: `base` |
 | `--quality 720p60,720p,best` | 720p | `best` for 1080p (bigger files) |
+| `--encoder auto` | auto | `x264` to force software encoding, `amf`/`nvenc` to force a GPU one |
+| `--cpu-only` | off | Never touch the GPU (software encoding + CPU captions) |
 | `--no-captions` | off | Skip Whisper completely |
 | `--test-clip-after 30` | off | Test the setup: forces one clip after 30 s |
 

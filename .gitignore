@@ -1,5 +1,7 @@
 clips/
 __pycache__/
 .venv/
+venv/
+zluda/
 *.ts
 *.mp4
